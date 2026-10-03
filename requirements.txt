@@ -1,0 +1,4 @@
+primp==2.0.1
+selectolax==0.4.13
+psycopg[binary]>=3.2,<4
+python-dotenv==1.0.0

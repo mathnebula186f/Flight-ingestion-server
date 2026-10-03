@@ -1,0 +1,323 @@
+# Flight Ingestion Server
+
+Collects **daily flight prices for Indian domestic routes** from Google Flights and stores them in Postgres (Neon),
+building the price-over-time history needed to predict the best day to book a flight.
+
+It is not a long-running server: it is a Python package (`python -m ingestion`) that runs once per day on a schedule
+(GitHub Actions) and on demand (manual trigger).
+
+---
+
+## Contents
+
+- [What it collects](#what-it-collects)
+- [How it works](#how-it-works)
+- [Data source details](#data-source-details)
+- [Known limitations](#known-limitations)
+- [Database schema](#database-schema)
+- [Setup](#setup)
+- [Usage](#usage)
+- [CRUD layer](#crud-layer)
+- [Deployment (GitHub Actions)](#deployment-github-actions)
+- [Operations](#operations)
+- [Project structure](#project-structure)
+- [Roadmap](#roadmap)
+
+---
+
+## What it collects
+
+| Item | Value |
+|---|---|
+| Airports | DEL, BLR, HYD, GOI, IXC, BOM, MAA, CCU, AMD, COK (10) |
+| Routes | every ordered pair: 10 x 9 = **90 routes** |
+| Departure dates | **1-30 days ahead** of the scrape day (configurable) |
+| Searches per day | 90 x 30 = **2,700** (2 page fetches each: Best + Cheapest tab) |
+| Trip type | one-way, 1 adult, economy, INR |
+| Per itinerary | flight numbers, legs, times, duration, stops, plane, **listed price** (Best tab), **cheapest price** (Cheapest tab) |
+| Per route + date | Google's current lowest price, typical price range, and **~60 days of price history** |
+
+Because every departure date is scraped on many consecutive days, each itinerary gets a series of prices at
+30, 29, ... 1 days before departure (`days_before_departure`), which is the core training data for prediction.
+
+---
+
+## How it works
+
+```
+python -m ingestion run
+  for each route x departure date:
+    1. google_flights.fetch_tab(..., "listed")    GET google.com/travel/flights/search  (Best tab)
+    2. wait 3 s
+    3. google_flights.fetch_tab(..., "cheapest")  same URL, Cheapest tab
+    4. parser.parse_flights / parse_price_insights   (data embedded in the page, script.ds:1)
+    5. google_flights.merge                       one row per itinerary with both prices
+    6. store.save_search                          one transaction, 8 bulk SQL statements
+    7. wait 3 s
+  summary + exit code
+```
+
+- About **7 s per search** (two fetches + delays) plus well under 1 s of database time.
+- One database connection per run; each search is saved in one transaction with a fixed number of bulk
+  statements (`INSERT ... SELECT FROM unnest(...)`), independent of how many flights were found.
+
+---
+
+## Data source details
+
+Google Flights embeds its search results as JSON inside the HTML page (`<script class="ds:1">`). We request the page
+exactly as the website does and parse that JSON. No browser, no paid API.
+
+### Request
+
+`GET https://www.google.com/travel/flights/search?tfs=<query>&tfu=<tab>&hl=en&curr=INR`
+
+- **`tfs`** - base64 protobuf describing the search. Built by `google_flights.build_tfs()` byte-for-byte as the
+  website builds it. (The `fast-flights` library builds a shorter `tfs`; with it the Cheapest tab missed cheaper
+  booking-site fares, e.g. IXC-DEL 2026-10-10: 5,638 vs 5,510 in the browser.)
+- **`tfu`** - selects the results tab rendered into the HTML: `EgYIACABKBIiAA` = **Best**, `EgYIACACKBMiAA` =
+  **Cheapest** (protobuf field 4 = 1 / 2; field 5 is a UI click counter and is irrelevant).
+- Requests use `primp` with a Chrome browser fingerprint.
+
+### Two prices per itinerary
+
+| Column | Tab | Meaning |
+|---|---|---|
+| `price_listed_inr` | Best | the standard (usually airline-direct) price |
+| `price_cheapest_inr` | Cheapest | lowest across booking options (often an online travel agency) |
+
+### Payload map (`ingestion/parser.py`)
+
+| Path | Content |
+|---|---|
+| `payload[2][0]` / `payload[3][0]` | "best" / "other" flight lists |
+| `item[1][0][1]` | price (missing = "price unavailable") |
+| `leg[22]` | `[airline code, flight number, _, airline name]` |
+| `payload[5][1][1]`, `[5][4][1]`, `[5][5][1]` | current lowest price, typical range low / high |
+| `payload[5][10][0]` | price history `[[epoch_ms, lowest_price], ...]` (Best tab page only) |
+
+---
+
+## Known limitations
+
+These were found while testing (see `../experiment/`) and are accepted for v1.
+
+1. **Cold searches can be incomplete.** The page only contains fares Google already has cached. Fares Google has
+   not fetched recently (seen mostly for **Air India / Air India Express / Alliance Air**, and on less-searched
+   routes) are either listed with **"price unavailable"** or **missing entirely**. A real browser fills them in via a
+   background request (`GetShoppingResults`); plain page fetches (ours, and SerpAPI's) do not trigger it.
+   - Unpriced itineraries are **stored with NULL prices**, so the flight's existence is still recorded.
+   - Itineraries missing from the page cannot be recorded.
+   - For route-level analysis, prefer Google's own history (`route_daily_prices`), which does not have this gap.
+2. **Cheapest-tab fares vary** between fetches as booking-site fares come and go; a Cheapest price can occasionally
+   exceed the Best price because the two tabs are fetched seconds apart.
+3. **Undocumented source.** Google can change the page format or `tfs` encoding at any time; the parser and
+   `build_tfs` would then need updating. Failures are loud (search errors, non-zero exit).
+4. **Blocking.** Tested only from a residential IP. Data-centre IPs (GitHub Actions) may be blocked more often; the
+   run stops after 5 consecutive failures. Proxy support is not implemented yet.
+5. Legs without a flight number in Google's data cannot be identified; such itineraries are skipped and counted.
+
+---
+
+## Database schema
+
+Full DDL: [`db/schema.sql`](db/schema.sql). 7 tables:
+
+| Table | One row per | Key |
+|---|---|---|
+| `airports` | airport (10 seeded; connection airports auto-added, `city` NULL) | `code` |
+| `airlines` | airline (auto-added) | `code` |
+| `flights` | physical flight leg | `UNIQUE (flight_number, origin, destination)` e.g. `AI 2533 IXC-DEL` |
+| `itineraries` | what is sold as one ticket (1 leg = nonstop, 2-3 = connection) | `UNIQUE legs_key` e.g. `6E 2193:IXC-DEL>6E 5321:DEL-COK` |
+| `itinerary_legs` | leg of an itinerary, in order | `(itinerary_id, leg_order)` |
+| `price_observations` | itinerary x departure date x scrape day | `UNIQUE (itinerary_id, flight_date, scrape_date)` |
+| `route_daily_prices` | route x departure date x day: lowest price on the route | `(origin, destination, flight_date, price_date)` |
+
+Rules enforced by the code:
+
+- Re-running on the same day **updates** price rows but **never replaces a known price with NULL**.
+- `route_daily_prices.source`: `scrape` (our scrape that day, includes Google's typical range) always overwrites
+  `google_history` (backfilled from Google's ~60-day history) for the same day, never the reverse.
+- `days_before_departure` is a generated column (`flight_date - scrape_date`).
+- Deleting a flight/itinerary still referenced by prices fails (no orphaned data).
+
+### Example queries
+
+```sql
+-- Price history of every itinerary on a route for one departure date
+SELECT i.legs_key, p.scrape_date, p.days_before_departure, p.price_listed_inr, p.price_cheapest_inr
+FROM price_observations p JOIN itineraries i ON i.id = p.itinerary_id
+WHERE i.origin = 'IXC' AND i.destination = 'DEL' AND p.flight_date = '2026-10-20'
+ORDER BY i.legs_key, p.scrape_date;
+
+-- Lowest price on a route for one departure date, day by day (history + our scrapes)
+SELECT price_date, lowest_price_inr, source
+FROM route_daily_prices
+WHERE origin = 'IXC' AND destination = 'DEL' AND flight_date = '2026-10-20'
+ORDER BY price_date;
+
+-- Coverage of today's scrape: how many itineraries had no price
+SELECT count(*) FILTER (WHERE price_listed_inr IS NULL AND price_cheapest_inr IS NULL) AS unpriced, count(*) AS total
+FROM price_observations WHERE scrape_date = CURRENT_DATE;
+```
+
+---
+
+## Setup
+
+Requires Python 3.10+.
+
+```powershell
+cd flight_ingestion_server
+python -m venv myenv
+.\myenv\Scripts\activate          # macOS/Linux: source myenv/bin/activate
+pip install -r requirements.txt
+copy .env.example .env            # then set DATABASE_URL
+```
+
+### Database (Neon)
+
+One Neon project with two branches:
+
+| Branch | Used by | `DATABASE_URL` lives in |
+|---|---|---|
+| `main` (prod) | GitHub Actions | GitHub repo secret `DATABASE_URL` |
+| dev | local runs | `.env` (never committed) |
+
+1. Run [`db/schema.sql`](db/schema.sql) once per branch in the Neon SQL Editor (or run it on `main` and
+   *Reset from parent* the dev branch).
+2. Every branch needs a **compute** (the running Postgres server) to accept connections. Free-plan computes sleep
+   when idle and wake automatically on the next connection.
+
+---
+
+## Usage
+
+```powershell
+python -m ingestion run                                # all 90 routes, 1-30 days ahead
+python -m ingestion run --origins DEL BLR              # only routes departing these airports
+python -m ingestion run --routes IXC-DEL BLR-GOI       # specific routes
+python -m ingestion run --days 1-7 14 21               # days ahead (ranges allowed)
+python -m ingestion run --dates 2026-10-20 2026-10-21  # exact departure dates (overrides --days)
+python -m ingestion run --routes IXC-DEL --days 7 --dry-run   # scrape + parse only, no database
+```
+
+`--days 7` means "departures 7 days from today" (one date), not seven dates.
+
+Output:
+
+- `logs/run_<timestamp>.log` - one line per search:
+  `OK [12/270] IXC->DEL 2026-10-10: 8 itineraries (0 unpriced), min 5638, history 61d, 4.4s`
+- `logs/dryrun_<timestamp>.json` - full parsed results (dry runs only)
+
+---
+
+## CRUD layer
+
+`ingestion/CRUD/` has one module per table. Every function takes a psycopg connection and returns dicts.
+
+| Module | Functions |
+|---|---|
+| `airports`, `airlines` | `create`, `ensure_many`, `get`, `list_all`, `update`, `delete` |
+| `flights` | `upsert`, `upsert_many`, `get`, `get_by_number`, `list_all`, `update`, `delete` |
+| `itineraries` | `make_legs_key`, `upsert`, `upsert_many`, `get`, `get_by_legs_key`, `list_for_route`, `update`, `delete` |
+| `itinerary_legs` | `add_many`, `insert_many`, `list_for_itinerary`, `replace`, `delete_for_itinerary` |
+| `price_observations` | `upsert`, `upsert_many`, `get`, `list_for_itinerary`, `list_for_route`, `update`, `delete`, `delete_for_scrape_date` |
+| `route_daily_prices` | `upsert_scrape`, `insert_history_many`, `get`, `list_for_route`, `update`, `delete`, `delete_for_route` |
+
+`*_many` functions write all rows in **one statement**; ingestion (`store.py`) uses only these.
+
+```python
+from ingestion import store
+from ingestion.CRUD import price_observations
+
+conn = store.connect()
+rows = price_observations.list_for_route(conn, "IXC", "DEL", date(2026, 10, 20))
+```
+
+---
+
+## Deployment (GitHub Actions)
+
+> Status: **planned** - `.github/workflows/ingest.yml` is not written yet.
+
+- **Schedule:** daily, 6:00 AM IST (00:30 UTC).
+- **Manual run:** Actions tab -> "Flight ingestion" -> **Run workflow**, with inputs `routes`, `origins`, `days`,
+  `dates`, `dry_run`. Also possible via `gh workflow run ingest.yml -f routes="IXC-DEL" -f days="1-7"` or the
+  GitHub REST API (`POST .../actions/workflows/ingest.yml/dispatches`), e.g. from a future dashboard button.
+- **Parallel jobs:** a GitHub job is limited to 6 hours. The full run (2,700 searches x ~7 s ~ 5.3 h) is split into
+  **10 jobs, one per departure airport** (`--origins <code>`, 270 searches, ~32 min each).
+- **Secret:** `DATABASE_URL` (Neon `main` branch) in repo Settings -> Secrets and variables -> Actions.
+- A run with > 20 % failed searches exits non-zero, so GitHub marks it failed and emails the repo owner.
+
+---
+
+## Operations
+
+| Setting (`ingestion/config.py`) | Value | Purpose |
+|---|---|---|
+| `DEFAULT_DAYS_AHEAD` | 1-30 | departure dates per route |
+| `DELAY_SECONDS` | 3 | between tab fetches and between searches |
+| `MAX_CONSECUTIVE_FAILURES` | 5 | stop the run (likely blocked) |
+| `MAX_FAILURE_RATE` | 0.2 | above this the run exits non-zero |
+
+- A failed search (network error, blocked page, parse error) is logged and skipped; the run continues.
+- A lost database connection is re-opened once per search.
+- To redo a bad day: `price_observations.delete_for_scrape_date(conn, date)` then re-run.
+
+---
+
+## Project structure
+
+```
+flight_ingestion_server/
+├── db/schema.sql                 # tables + seeded airports
+├── ingestion/
+│   ├── __main__.py               # CLI: argument parsing, run loop, logging, exit code
+│   ├── config.py                 # airports, days, delays, DATABASE_URL
+│   ├── google_flights.py         # build_tfs, fetch Best/Cheapest tabs, merge
+│   ├── parser.py                 # Google payload -> itineraries, price insights
+│   ├── store.py                  # save one search (bulk, one transaction)
+│   └── CRUD/                     # one module per table
+├── requirements.txt
+├── .env.example
+└── README.md
+```
+
+---
+
+## Roadmap
+
+### 1. Ingestion (this repo) - remaining
+
+- [ ] Code review
+- [ ] First real run against the dev branch (3 routes), verify tables, re-run to verify idempotency
+- [ ] Larger local run (e.g. 10 routes x 3 dates): timing, coverage, blocking
+- [ ] Run `schema.sql` on the `main` branch
+- [ ] GitHub repo + `.github/workflows/ingest.yml` (schedule + manual inputs + 10-job matrix)
+- [ ] First small cloud run: check whether Google blocks GitHub's IPs; add proxy support only if needed
+- [ ] Enable the full daily run; watch the first week (failures, unpriced %, run time)
+
+### 2. Prediction model (next)
+
+Goal: given a route and departure date, draw the **expected price curve** from today until departure and mark the
+**cheapest day to book** ("book now" vs "wait").
+
+- Explore data: Google's ~60-day route history (`route_daily_prices`) is available from the first run;
+  per-itinerary history (`price_observations`) accumulates daily.
+- Baseline: average price curve by `days_before_departure` per route, scaled to today's price.
+- Model: gradient boosting (XGBoost/LightGBM) predicting price at each future `days_before_departure`.
+  Candidate features: route, days before departure, weekday of flight and of scrape, holidays/festivals,
+  today's price vs Google's typical range, recent price trend, stops, airline.
+- Evaluation: train on earlier departure dates, test on later ones; measure price error and
+  "predicted cheapest day vs actual cheapest day".
+- Stage 1 route-level (Google history), stage 2 per-itinerary (after ~30+ days of our own data).
+
+### 3. Application server (later)
+
+FastAPI service reading Neon: routes, price history, predicted curve, cheapest day, airline comparison; optionally
+triggers manual ingestion through the GitHub API.
+
+### 4. Frontend (later)
+
+Next.js dashboard: route + date picker, price-history chart with forecast, cheapest-day view, airline comparison.
