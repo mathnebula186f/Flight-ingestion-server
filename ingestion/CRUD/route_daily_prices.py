@@ -2,9 +2,7 @@ from datetime import date
 
 import psycopg
 
-from ._common import cursor, update_row
-
-UPDATABLE = {"lowest_price_inr", "typical_low_inr", "typical_high_inr", "source"}
+from ._common import cursor
 
 
 def upsert_scrape(conn: psycopg.Connection, origin: str, destination: str, flight_date: date, price_date: date,
@@ -40,55 +38,3 @@ def insert_history_many(conn: psycopg.Connection, origin: str, destination: str,
                ON CONFLICT (origin, destination, flight_date, price_date) DO NOTHING""",
             (origin, destination, flight_date, price_dates, prices),
         )
-
-
-def get(conn: psycopg.Connection, origin: str, destination: str, flight_date: date,
-        price_date: date) -> dict | None:
-    with cursor(conn) as cur:
-        cur.execute(
-            """SELECT * FROM route_daily_prices
-               WHERE origin = %s AND destination = %s AND flight_date = %s AND price_date = %s""",
-            (origin, destination, flight_date, price_date),
-        )
-        return cur.fetchone()
-
-
-def list_for_route(conn: psycopg.Connection, origin: str, destination: str, flight_date: date, *,
-                   source: str | None = None) -> list[dict]:
-    """Lowest price on the route for one departure date, day by day (optionally one source)."""
-    with cursor(conn) as cur:
-        cur.execute(
-            """SELECT * FROM route_daily_prices
-               WHERE origin = %(o)s AND destination = %(d)s AND flight_date = %(fd)s
-                 AND (%(src)s::text IS NULL OR source = %(src)s)
-               ORDER BY price_date""",
-            {"o": origin, "d": destination, "fd": flight_date, "src": source},
-        )
-        return cur.fetchall()
-
-
-def update(conn: psycopg.Connection, origin: str, destination: str, flight_date: date, price_date: date,
-           **values) -> dict | None:
-    keys = {"origin": origin, "destination": destination, "flight_date": flight_date, "price_date": price_date}
-    return update_row(conn, "route_daily_prices", keys, values, UPDATABLE)
-
-
-def delete(conn: psycopg.Connection, origin: str, destination: str, flight_date: date, price_date: date) -> bool:
-    with cursor(conn) as cur:
-        cur.execute(
-            """DELETE FROM route_daily_prices
-               WHERE origin = %s AND destination = %s AND flight_date = %s AND price_date = %s""",
-            (origin, destination, flight_date, price_date),
-        )
-        return cur.rowcount > 0
-
-
-def delete_for_route(conn: psycopg.Connection, origin: str, destination: str,
-                     flight_date: date | None = None) -> int:
-    with cursor(conn) as cur:
-        cur.execute(
-            """DELETE FROM route_daily_prices
-               WHERE origin = %(o)s AND destination = %(d)s AND (%(fd)s::date IS NULL OR flight_date = %(fd)s)""",
-            {"o": origin, "d": destination, "fd": flight_date},
-        )
-        return cur.rowcount

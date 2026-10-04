@@ -11,6 +11,7 @@
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -19,6 +20,8 @@ from itertools import permutations
 import psycopg
 
 from . import config, google_flights, store
+from .CRUD import ingestion_runs
+from .constants import MAX_ERRORS_STORED
 
 log = logging.getLogger("ingestion")
 
@@ -54,6 +57,35 @@ def setup_logging(run_id: str):
     logging.getLogger("primp").setLevel(logging.WARNING)
 
 
+def github_context() -> tuple[str, str | None]:
+    """('schedule' | 'workflow_dispatch' | 'local', link to the GitHub Actions run or None)."""
+    event = os.environ.get("GITHUB_EVENT_NAME")
+    if not event:
+        return "local", None
+    env = os.environ
+    return event, f"{env.get('GITHUB_SERVER_URL')}/{env.get('GITHUB_REPOSITORY')}/actions/runs/{env.get('GITHUB_RUN_ID')}"
+
+
+def record_finish(conn, run_pk: int | None, status: str, counts: dict, errors: list[dict]) -> None:
+    """Complete the ingestion_runs row; never let a failure here hide the run's own result."""
+    if conn is None or run_pk is None:
+        return
+    kwargs = dict(status=status, finished_at=datetime.now(config.IST), searches_ok=counts["ok"],
+                  searches_failed=counts["failed"], itineraries_saved=counts["saved"],
+                  itineraries_unpriced=counts["unpriced"], itineraries_skipped=counts["skipped"],
+                  errors=errors[:MAX_ERRORS_STORED])
+    try:
+        ingestion_runs.finish(conn, run_pk, **kwargs)
+    except psycopg.OperationalError:
+        try:
+            with store.connect() as fresh:
+                ingestion_runs.finish(fresh, run_pk, **kwargs)
+        except Exception as e:
+            log.error(f"could not record run status: {type(e).__name__}: {e}")
+    except Exception as e:
+        log.error(f"could not record run status: {type(e).__name__}: {e}")
+
+
 def run(args) -> int:
     now = datetime.now(config.IST)
     run_id = now.strftime("%Y%m%d_%H%M%S")
@@ -70,68 +102,97 @@ def run(args) -> int:
              f"= {total} searches, scrape_date {scrape_date}")
 
     conn = None if args.dry_run else store.connect()
-    dry_results = []
-    ok = failed = consecutive_failures = flights_total = unpriced_total = skipped_total = 0
+    run_pk = None
+    if conn:
+        trigger, github_run_url = github_context()
+        run_pk = ingestion_runs.start(
+            conn, run_id=run_id, trigger=trigger, github_run_url=github_run_url,
+            params={"routes": args.routes, "origins": args.origins,
+                    "days": None if args.dates else args.days, "dates": args.dates},
+            scrape_date=scrape_date, started_at=now, searches_total=total,
+        )
+
+    dry_results, errors = [], []
+    counts = {"ok": 0, "failed": 0, "saved": 0, "unpriced": 0, "skipped": 0}
+    consecutive_failures = 0
+    stopped_blocked = False
     started = time.monotonic()
 
-    for n, ((origin, dest), flight_date) in enumerate(((r, d) for r in routes for d in dates), 1):
-        label = f"[{n}/{total}] {origin}->{dest} {flight_date}"
-        t0 = time.monotonic()
-        try:
-            result = google_flights.scrape(origin, dest, flight_date.isoformat())
-            scraped_at = datetime.now(config.IST)
-            if args.dry_run:
-                dry_results.append({"origin": origin, "destination": dest, "flight_date": flight_date.isoformat(),
-                                    **result})
-                stats = {"saved": len(result["flights"]), "skipped": 0,
-                         "unpriced": sum(f["price_listed_inr"] is None and f["price_cheapest_inr"] is None
-                                         for f in result["flights"]),
-                         "history_days": len((result["price_insights"] or {}).get("price_history", []))}
-            else:
-                try:
-                    stats = store.save_search(conn, origin, dest, flight_date, scrape_date, scraped_at, result)
-                except psycopg.OperationalError:
-                    log.warning("database connection lost, reconnecting once")
-                    conn = store.connect()
-                    stats = store.save_search(conn, origin, dest, flight_date, scrape_date, scraped_at, result)
+    try:
+        for n, ((origin, dest), flight_date) in enumerate(((r, d) for r in routes for d in dates), 1):
+            label = f"[{n}/{total}] {origin}->{dest} {flight_date}"
+            t0 = time.monotonic()
+            try:
+                result = google_flights.scrape(origin, dest, flight_date.isoformat())
+                scraped_at = datetime.now(config.IST)
+                if args.dry_run:
+                    dry_results.append({"origin": origin, "destination": dest,
+                                        "flight_date": flight_date.isoformat(), **result})
+                    stats = {"saved": len(result["flights"]), "skipped": 0,
+                             "unpriced": sum(f["price_listed_inr"] is None and f["price_cheapest_inr"] is None
+                                             for f in result["flights"]),
+                             "history_days": len((result["price_insights"] or {}).get("price_history", []))}
+                else:
+                    try:
+                        stats = store.save_search(conn, origin, dest, flight_date, scraped_at, result)
+                    except psycopg.OperationalError:
+                        log.warning("database connection lost, reconnecting once")
+                        conn = store.connect()
+                        stats = store.save_search(conn, origin, dest, flight_date, scraped_at, result)
 
-            ok += 1
-            consecutive_failures = 0
-            flights_total += stats["saved"]
-            unpriced_total += stats["unpriced"]
-            skipped_total += stats["skipped"]
-            prices = [p for f in result["flights"] for p in (f["price_listed_inr"], f["price_cheapest_inr"]) if p]
-            log.info(f"OK   {label}: {stats['saved']} itineraries ({stats['unpriced']} unpriced"
-                     f"{', ' + str(stats['skipped']) + ' skipped' if stats['skipped'] else ''}), "
-                     f"min {min(prices) if prices else '-'}, history {stats['history_days']}d, "
-                     f"{time.monotonic() - t0:.1f}s"
-                     + (f", TAB ERRORS {result['tab_errors']}" if result["tab_errors"] else ""))
-        except Exception as e:
-            failed += 1
-            consecutive_failures += 1
-            log.error(f"FAIL {label}: {type(e).__name__}: {str(e)[:300]}")
-            if consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
-                log.error(f"{consecutive_failures} failures in a row - stopping (likely blocked)")
-                break
+                counts["ok"] += 1
+                consecutive_failures = 0
+                counts["saved"] += stats["saved"]
+                counts["unpriced"] += stats["unpriced"]
+                counts["skipped"] += stats["skipped"]
+                prices = [p for f in result["flights"] for p in (f["price_listed_inr"], f["price_cheapest_inr"]) if p]
+                log.info(f"OK   {label}: {stats['saved']} itineraries ({stats['unpriced']} unpriced"
+                         f"{', ' + str(stats['skipped']) + ' skipped' if stats['skipped'] else ''}), "
+                         f"min {min(prices) if prices else '-'}, history {stats['history_days']}d, "
+                         f"{time.monotonic() - t0:.1f}s"
+                         + (f", TAB ERRORS {result['tab_errors']}" if result["tab_errors"] else ""))
+            except Exception as e:
+                counts["failed"] += 1
+                consecutive_failures += 1
+                message = f"{type(e).__name__}: {str(e)[:300]}"
+                errors.append({"route": f"{origin}-{dest}", "flight_date": flight_date.isoformat(), "error": message})
+                log.error(f"FAIL {label}: {message}")
+                if consecutive_failures >= config.MAX_CONSECUTIVE_FAILURES:
+                    log.error(f"{consecutive_failures} failures in a row - stopping (likely blocked)")
+                    stopped_blocked = True
+                    break
 
-        if n < total:
-            time.sleep(config.DELAY_SECONDS)
+            if n < total:
+                time.sleep(config.DELAY_SECONDS)
+    except BaseException as e:  # crash or Ctrl+C: still mark the run, then re-raise
+        errors.append({"route": None, "flight_date": None, "error": f"run crashed: {type(e).__name__}: {e}"})
+        record_finish(conn, run_pk, "crashed", counts, errors)
+        raise
 
-    if conn:
-        conn.close()
     if args.dry_run:
         out = config.LOG_DIR / f"dryrun_{run_id}.json"
         out.write_text(json.dumps(dry_results, indent=2, ensure_ascii=False), encoding="utf-8")
         log.info(f"Dry-run results: {out}")
 
-    attempted = ok + failed
-    failure_rate = failed / attempted if attempted else 1.0
-    log.info(f"Done in {(time.monotonic() - started) / 60:.1f} min: {ok}/{total} searches OK, {failed} failed, "
-             f"{flights_total} itineraries ({unpriced_total} unpriced, {skipped_total} skipped)")
-    if attempted < total or failure_rate > config.MAX_FAILURE_RATE:
-        log.error(f"Run unhealthy: {attempted}/{total} attempted, failure rate {failure_rate:.0%}")
-        return 1
-    return 0
+    attempted = counts["ok"] + counts["failed"]
+    failure_rate = counts["failed"] / attempted if attempted else 1.0
+    if stopped_blocked:
+        status = "stopped_blocked"
+    elif attempted < total or failure_rate > config.MAX_FAILURE_RATE:
+        status = "unhealthy"
+    else:
+        status = "ok"
+
+    log.info(f"Done in {(time.monotonic() - started) / 60:.1f} min [{status}]: {counts['ok']}/{total} searches OK, "
+             f"{counts['failed']} failed, {counts['saved']} itineraries "
+             f"({counts['unpriced']} unpriced, {counts['skipped']} skipped)")
+    if status != "ok":
+        log.error(f"Run {status}: {attempted}/{total} attempted, failure rate {failure_rate:.0%}")
+
+    record_finish(conn, run_pk, status, counts, errors)
+    if conn:
+        conn.close()
+    return 0 if status == "ok" else 1
 
 
 def main():

@@ -121,7 +121,7 @@ These were found while testing (see `../experiment/`) and are accepted for v1.
 
 ## Database schema
 
-Full DDL: [`db/schema.sql`](db/schema.sql). 7 tables:
+Full DDL: [`db/schema.sql`](db/schema.sql). 8 tables:
 
 | Table | One row per | Key |
 |---|---|---|
@@ -130,25 +130,39 @@ Full DDL: [`db/schema.sql`](db/schema.sql). 7 tables:
 | `flights` | physical flight leg | `UNIQUE (flight_number, origin, destination)` e.g. `AI 2533 IXC-DEL` |
 | `itineraries` | what is sold as one ticket (1 leg = nonstop, 2-3 = connection) | `UNIQUE legs_key` e.g. `6E 2193:IXC-DEL>6E 5321:DEL-COK` |
 | `itinerary_legs` | leg of an itinerary, in order | `(itinerary_id, leg_order)` |
-| `price_observations` | itinerary x departure date x scrape day | `UNIQUE (itinerary_id, flight_date, scrape_date)` |
+| `price_observations` | itinerary x departure date x **scrape** (every run adds rows) | `UNIQUE (itinerary_id, flight_date, scraped_at)` |
 | `route_daily_prices` | route x departure date x day: lowest price on the route | `(origin, destination, flight_date, price_date)` |
+| `ingestion_runs` | ingestion run (one per GitHub job): trigger, status, counts, failed searches | `id` |
 
 Rules enforced by the code:
 
-- Re-running on the same day **updates** price rows but **never replaces a known price with NULL**.
+- `price_observations` is **append-only**: every run adds its own rows, identified by `scraped_at`, so prices that
+  change within a day are kept. Two runs on the same day = two rows per itinerary; existing rows are never changed.
+  Storage grows with the number of runs, not days.
+- Times: `scraped_at` is a `TIMESTAMPTZ` (an exact moment). For the **IST day** of a scrape always use
+  `(scraped_at AT TIME ZONE 'Asia/Kolkata')::date` - a plain `scraped_at::date` uses the session timezone (UTC on
+  Neon) and puts scrapes between 00:00 and 05:30 IST on the previous day. All `DATE`/`TIME` columns are IST
+  (local times of Indian airports).
+- `days_before_departure` is a generated column: `flight_date - (scraped_at AT TIME ZONE 'Asia/Kolkata')::date`.
 - `route_daily_prices.source`: `scrape` (our scrape that day, includes Google's typical range) always overwrites
   `google_history` (backfilled from Google's ~60-day history) for the same day, never the reverse.
-- `days_before_departure` is a generated column (`flight_date - scrape_date`).
 - Deleting a flight/itinerary still referenced by prices fails (no orphaned data).
 
 ### Example queries
 
 ```sql
 -- Price history of every itinerary on a route for one departure date
-SELECT i.legs_key, p.scrape_date, p.days_before_departure, p.price_listed_inr, p.price_cheapest_inr
+SELECT i.legs_key, p.scraped_at AT TIME ZONE 'Asia/Kolkata' AS scraped_ist, p.days_before_departure,
+       p.price_listed_inr, p.price_cheapest_inr
 FROM price_observations p JOIN itineraries i ON i.id = p.itinerary_id
 WHERE i.origin = 'IXC' AND i.destination = 'DEL' AND p.flight_date = '2026-10-20'
-ORDER BY i.legs_key, p.scrape_date;
+ORDER BY i.legs_key, p.scraped_at;
+
+-- Latest price of each itinerary per IST day (when a day has several scrapes)
+SELECT DISTINCT ON (itinerary_id, flight_date, scrape_day)
+       itinerary_id, flight_date, scrape_day, scraped_at, price_listed_inr, price_cheapest_inr
+FROM (SELECT *, (scraped_at AT TIME ZONE 'Asia/Kolkata')::date AS scrape_day FROM price_observations) p
+ORDER BY itinerary_id, flight_date, scrape_day, scraped_at DESC;
 
 -- Lowest price on a route for one departure date, day by day (history + our scrapes)
 SELECT price_date, lowest_price_inr, source
@@ -156,9 +170,15 @@ FROM route_daily_prices
 WHERE origin = 'IXC' AND destination = 'DEL' AND flight_date = '2026-10-20'
 ORDER BY price_date;
 
+-- Recent runs: did they finish, how many searches failed, which ones
+SELECT run_id, trigger, params->'origins' AS origins, status, searches_ok, searches_failed,
+       itineraries_unpriced, finished_at - started_at AS took, errors
+FROM ingestion_runs ORDER BY started_at DESC LIMIT 20;
+
 -- Coverage of today's scrape: how many itineraries had no price
 SELECT count(*) FILTER (WHERE price_listed_inr IS NULL AND price_cheapest_inr IS NULL) AS unpriced, count(*) AS total
-FROM price_observations WHERE scrape_date = CURRENT_DATE;
+FROM price_observations
+WHERE (scraped_at AT TIME ZONE 'Asia/Kolkata')::date = (now() AT TIME ZONE 'Asia/Kolkata')::date;
 ```
 
 ---
@@ -214,26 +234,19 @@ Output:
 
 ## CRUD layer
 
-`ingestion/CRUD/` has one module per table. Every function takes a psycopg connection and returns dicts.
+`ingestion/CRUD/` has one module per table, containing only the writes ingestion needs. Each `*_many` function writes
+all rows in **one statement** (`INSERT ... SELECT FROM unnest(...)`); `store.py` calls them inside one transaction.
 
 | Module | Functions |
 |---|---|
-| `airports`, `airlines` | `create`, `ensure_many`, `get`, `list_all`, `update`, `delete` |
-| `flights` | `upsert`, `upsert_many`, `get`, `get_by_number`, `list_all`, `update`, `delete` |
-| `itineraries` | `make_legs_key`, `upsert`, `upsert_many`, `get`, `get_by_legs_key`, `list_for_route`, `update`, `delete` |
-| `itinerary_legs` | `add_many`, `insert_many`, `list_for_itinerary`, `replace`, `delete_for_itinerary` |
-| `price_observations` | `upsert`, `upsert_many`, `get`, `list_for_itinerary`, `list_for_route`, `update`, `delete`, `delete_for_scrape_date` |
-| `route_daily_prices` | `upsert_scrape`, `insert_history_many`, `get`, `list_for_route`, `update`, `delete`, `delete_for_route` |
+| `airports`, `airlines` | `ensure_many` (insert missing, leave existing) |
+| `flights` | `upsert_many` -> `{(flight_number, origin, destination): id}` |
+| `itineraries` | `make_legs_key`, `upsert_many` -> `{legs_key: id}` |
+| `itinerary_legs` | `insert_many` |
+| `price_observations` | `insert_many` (append-only, one row per itinerary per scrape) |
+| `route_daily_prices` | `upsert_scrape`, `insert_history_many` |
 
-`*_many` functions write all rows in **one statement**; ingestion (`store.py`) uses only these.
-
-```python
-from ingestion import store
-from ingestion.CRUD import price_observations
-
-conn = store.connect()
-rows = price_observations.list_for_route(conn, "IXC", "DEL", date(2026, 10, 20))
-```
+Read queries (for the model / application server) will be added when those are built.
 
 ---
 
@@ -261,9 +274,15 @@ rows = price_observations.list_for_route(conn, "IXC", "DEL", date(2026, 10, 20))
 | `MAX_CONSECUTIVE_FAILURES` | 5 | stop the run (likely blocked) |
 | `MAX_FAILURE_RATE` | 0.2 | above this the run exits non-zero |
 
+- Logging: every line goes to stdout (captured by GitHub Actions) and, locally, to `logs/run_<run_id>.log`.
+- Run history: each non-dry run writes an `ingestion_runs` row - `running` at start, then `ok`, `unhealthy`
+  (> 20 % failed or not all searches attempted), `stopped_blocked` (5 failures in a row) or `crashed`
+  (exception / Ctrl+C) at the end, with counts, trigger (`schedule` / `workflow_dispatch` / `local`), a link to the
+  GitHub Actions run, and the failed searches in `errors` (max 500).
 - A failed search (network error, blocked page, parse error) is logged and skipped; the run continues.
 - A lost database connection is re-opened once per search.
-- To redo a bad day: `price_observations.delete_for_scrape_date(conn, date)` then re-run.
+- To remove a bad run's prices: `DELETE FROM price_observations WHERE scraped_at BETWEEN '<run start>' AND '<run end>';`
+  (times from `ingestion_runs.started_at` / `finished_at`).
 
 ---
 

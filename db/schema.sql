@@ -3,8 +3,9 @@
 -- flights             one physical flight leg: flight number + sector (e.g. 6E 2193 IXC->DEL)
 -- itineraries         what is sold as one ticket: 1 leg (nonstop) or 2-3 legs (connections)
 -- itinerary_legs      ordered legs of an itinerary
--- price_observations  price of an itinerary for a departure date, seen on a scrape day
+-- price_observations  price of an itinerary for a departure date, seen at one scrape (scraped_at)
 -- route_daily_prices  route-level lowest price per day: from our scrapes + Google's ~60-day history
+-- ingestion_runs      one row per ingestion run: status, counts, failed searches
 
 CREATE TABLE airports (
     code        CHAR(3)     PRIMARY KEY,
@@ -51,9 +52,10 @@ CREATE TABLE price_observations (
     id                      BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     itinerary_id            UUID        NOT NULL REFERENCES itineraries(id),
     flight_date             DATE        NOT NULL,
-    scrape_date             DATE        NOT NULL,                   -- IST date of the scrape
-    scraped_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    days_before_departure   INTEGER     GENERATED ALWAYS AS (flight_date - scrape_date) STORED,
+    scraped_at              TIMESTAMPTZ NOT NULL,                   -- when this search was scraped
+    -- IST day of the scrape; day-level queries: (scraped_at AT TIME ZONE 'Asia/Kolkata')::date
+    days_before_departure   INTEGER     GENERATED ALWAYS AS
+                              (flight_date - (scraped_at AT TIME ZONE 'Asia/Kolkata')::date) STORED,
     dep_time                TIME        NOT NULL,
     arr_time                TIME        NOT NULL,
     arr_day_offset          SMALLINT    NOT NULL DEFAULT 0,         -- arrives next day = 1
@@ -62,7 +64,8 @@ CREATE TABLE price_observations (
     price_listed_inr        INTEGER     CHECK (price_listed_inr > 0),     -- "Best" tab
     price_cheapest_inr      INTEGER     CHECK (price_cheapest_inr > 0),   -- "Cheapest" tab
     listed_section          TEXT        CHECK (listed_section IN ('best', 'other')),
-    UNIQUE (itinerary_id, flight_date, scrape_date)
+    -- Every run adds its own rows (prices change within a day); never updated afterwards
+    UNIQUE (itinerary_id, flight_date, scraped_at)
 );
 
 CREATE INDEX idx_prices_flight_date ON price_observations (flight_date);
@@ -80,6 +83,28 @@ CREATE TABLE route_daily_prices (
     source              TEXT        NOT NULL CHECK (source IN ('scrape', 'google_history')),
     PRIMARY KEY (origin, destination, flight_date, price_date)
 );
+
+-- One row per ingestion run (per GitHub job): written as 'running' at start, completed at the end
+CREATE TABLE ingestion_runs (
+    id                      BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id                  TEXT        NOT NULL,                   -- same id as logs/run_<run_id>.log
+    trigger                 TEXT        NOT NULL,                   -- 'schedule' | 'workflow_dispatch' | 'local'
+    github_run_url          TEXT,
+    params                  JSONB       NOT NULL,                   -- routes / origins / days / dates arguments
+    scrape_date             DATE        NOT NULL,
+    started_at              TIMESTAMPTZ NOT NULL,
+    finished_at             TIMESTAMPTZ,
+    status                  TEXT        NOT NULL CHECK (status IN ('running', 'ok', 'unhealthy', 'stopped_blocked', 'crashed')),
+    searches_total          INTEGER     NOT NULL,
+    searches_ok             INTEGER     NOT NULL DEFAULT 0,
+    searches_failed         INTEGER     NOT NULL DEFAULT 0,
+    itineraries_saved       INTEGER     NOT NULL DEFAULT 0,
+    itineraries_unpriced    INTEGER     NOT NULL DEFAULT 0,
+    itineraries_skipped     INTEGER     NOT NULL DEFAULT 0,
+    errors                  JSONB       NOT NULL DEFAULT '[]'       -- [{route, flight_date, error}] of failed searches
+);
+
+CREATE INDEX idx_ingestion_runs_scrape_date ON ingestion_runs (scrape_date);
 
 INSERT INTO airports (code, name, city) VALUES
     ('DEL', 'Indira Gandhi International Airport', 'Delhi'),

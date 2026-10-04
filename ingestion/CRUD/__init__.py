@@ -1,4 +1,13 @@
-from . import airlines, airports, flights, itineraries, itinerary_legs, price_observations, route_daily_prices
+from . import (
+    airlines,
+    airports,
+    flights,
+    ingestion_runs,
+    itineraries,
+    itinerary_legs,
+    price_observations,
+    route_daily_prices,
+)
 
 __all__ = [
     "airports",
@@ -8,4 +17,5 @@ __all__ = [
     "itinerary_legs",
     "price_observations",
     "route_daily_prices",
+    "ingestion_runs",
 ]

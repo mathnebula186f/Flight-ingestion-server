@@ -4,7 +4,7 @@ from datetime import date, datetime, time
 
 import psycopg
 
-from .config import database_url
+from .config import IST, database_url
 from .CRUD import airlines, airports, flights, itineraries, itinerary_legs, price_observations, route_daily_prices
 
 
@@ -18,8 +18,9 @@ def _time(hhmm: str) -> time:
 
 
 def save_search(conn: psycopg.Connection, origin: str, dest: str, flight_date: date,
-                scrape_date: date, scraped_at: datetime, result: dict) -> dict:
+                scraped_at: datetime, result: dict) -> dict:
     """Returns counts: saved / skipped (legs without flight number) / unpriced / history_days."""
+    scrape_day = scraped_at.astimezone(IST).date()  # same day the DB derives for days_before_departure
     usable = [f for f in result["flights"]
               if all(leg["flight_number"] and leg["airline_code"] for leg in f["legs"])]
     stats = {"saved": len(usable), "skipped": len(result["flights"]) - len(usable),
@@ -49,9 +50,8 @@ def save_search(conn: psycopg.Connection, origin: str, dest: str, flight_date: d
             for key, f in keyed for i, leg in enumerate(f["legs"])
         ])
 
-        price_observations.upsert_many(conn, [
-            {"itinerary_id": itinerary_ids[key], "flight_date": flight_date, "scrape_date": scrape_date,
-             "scraped_at": scraped_at, "dep_time": _time(f["dep_time"]), "arr_time": _time(f["arr_time"]),
+        price_observations.insert_many(conn, [
+            {"itinerary_id": itinerary_ids[key], "flight_date": flight_date, "scraped_at": scraped_at, "dep_time": _time(f["dep_time"]), "arr_time": _time(f["arr_time"]),
              "arr_day_offset": (date.fromisoformat(f["arr_date"]) - date.fromisoformat(f["dep_date"])).days
              if f["arr_date"] and f["dep_date"] else 0,
              "duration_mins": f["duration_mins"], "price_listed_inr": f["price_listed_inr"],
@@ -61,7 +61,7 @@ def save_search(conn: psycopg.Connection, origin: str, dest: str, flight_date: d
 
         insights = result["price_insights"] or {}
         if insights.get("lowest_price_inr"):
-            route_daily_prices.upsert_scrape(conn, origin, dest, flight_date, scrape_date,
+            route_daily_prices.upsert_scrape(conn, origin, dest, flight_date, scrape_day,
                                              insights["lowest_price_inr"], insights.get("typical_low_inr"),
                                              insights.get("typical_high_inr"))
         history = [(date.fromisoformat(h["date"]), h["lowest_price_inr"])
