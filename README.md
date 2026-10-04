@@ -252,16 +252,30 @@ Read queries (for the model / application server) will be added when those are b
 
 ## Deployment (GitHub Actions)
 
-> Status: **planned** - `.github/workflows/ingest.yml` is not written yet.
+Workflow: [`.github/workflows/ingest.yml`](.github/workflows/ingest.yml)
 
-- **Schedule:** daily, 6:00 AM IST (00:30 UTC).
+- **Schedule:** daily at **14:00 IST** (`cron: "30 8 * * *"`, UTC). Afternoon was chosen because test searches then
+  had more complete fares (Air India group, Cheapest-tab prices) than early-morning ones. GitHub may start scheduled
+  runs some minutes late.
 - **Manual run:** Actions tab -> "Flight ingestion" -> **Run workflow**, with inputs `routes`, `origins`, `days`,
   `dates`, `dry_run`. Also possible via `gh workflow run ingest.yml -f routes="IXC-DEL" -f days="1-7"` or the
   GitHub REST API (`POST .../actions/workflows/ingest.yml/dispatches`), e.g. from a future dashboard button.
-- **Parallel jobs:** a GitHub job is limited to 6 hours. The full run (2,700 searches x ~7 s ~ 5.3 h) is split into
-  **10 jobs, one per departure airport** (`--origins <code>`, 270 searches, ~32 min each).
-- **Secret:** `DATABASE_URL` (Neon `main` branch) in repo Settings -> Secrets and variables -> Actions.
-- A run with > 20 % failed searches exits non-zero, so GitHub marks it failed and emails the repo owner.
+- **Jobs:** a `plan` job decides the shards; `ingest` runs one job per shard in parallel (`fail-fast: false`, so one
+  failing airport does not cancel the others; 90-minute timeout each):
+  - `routes` given -> 1 job (`--routes ...`)
+  - otherwise -> **one job per departure airport** (`--origins <code>`): all 10, or those listed in `origins`.
+    A GitHub job is limited to 6 hours; the full run (2,700 searches x ~7 s ~ 5.3 h) split 10 ways is ~32 min/job.
+- **Concurrency:** only one ingestion at a time; a new run waits for the running one.
+- **Logs:** printed to the Actions run page and uploaded as artifacts `logs-<shard>` (kept 14 days). The repo is
+  public, so these are public too - they contain only routes, prices and counts.
+- **Secret:** `DATABASE_URL` (Neon `main` branch) in repo Settings -> Secrets and variables -> Actions. Secret values
+  cannot be viewed after saving, are masked in logs, and are not passed to workflows from fork pull requests.
+- **Cost:** public repo -> standard GitHub-hosted runners are free. (A private repo's free minutes would not cover
+  ~10 jobs x ~32 min per day.)
+- **60-day rule:** GitHub disables scheduled workflows in public repos after 60 days without repository activity
+  (it emails a warning first). Any commit resets it; re-enable from the Actions tab if it happens.
+- A job with > 20 % failed searches exits non-zero, so GitHub marks it failed and emails the repo owner;
+  details are in `ingestion_runs`.
 
 ---
 
@@ -290,6 +304,7 @@ Read queries (for the model / application server) will be added when those are b
 
 ```
 flight_ingestion_server/
+├── .github/workflows/ingest.yml  # daily schedule + manual runs on GitHub Actions
 ├── db/schema.sql                 # tables + seeded airports
 ├── ingestion/
 │   ├── __main__.py               # CLI: argument parsing, run loop, logging, exit code

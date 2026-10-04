@@ -1,0 +1,104 @@
+name: Flight ingestion
+
+on:
+  schedule:
+    - cron: "30 8 * * *"   # 08:30 UTC = 14:00 IST (GitHub may start scheduled runs some minutes late)
+  workflow_dispatch:
+    inputs:
+      routes:
+        description: "Routes, e.g. IXC-DEL BLR-GOI (empty = all routes, split per departure airport)"
+        required: false
+        default: ""
+      origins:
+        description: "Departure airports, e.g. DEL BLR (empty = all 10; ignored if routes is set)"
+        required: false
+        default: ""
+      days:
+        description: "Days ahead, e.g. 1-30 or 1-7 14 21"
+        required: false
+        default: "1-30"
+      dates:
+        description: "Exact departure dates, e.g. 2026-10-20 2026-10-21 (overrides days)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run (scrape + parse only, nothing saved)"
+        type: boolean
+        default: false
+
+# One ingestion at a time; a new run waits for the previous one instead of cancelling it
+concurrency:
+  group: flight-ingestion
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: plan
+        env:
+          ROUTES: ${{ inputs.routes }}
+          ORIGINS: ${{ inputs.origins }}
+        # routes given -> 1 job; otherwise 1 job per departure airport (keeps each job well under 6 h)
+        run: |
+          pip install --quiet python-dotenv
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          from ingestion.config import AIRPORTS
+          routes = os.environ.get("ROUTES", "").split()
+          origins = os.environ.get("ORIGINS", "").upper().split()
+          shards = ["routes"] if routes else (origins or AIRPORTS)
+          print("shards=" + json.dumps(shards))
+          EOF
+
+  ingest:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Run ingestion (${{ matrix.shard }})
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHARD: ${{ matrix.shard }}
+          ROUTES: ${{ inputs.routes }}
+          DAYS: ${{ inputs.days || '1-30' }}
+          DATES: ${{ inputs.dates }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        # Inputs are passed via env (never interpolated into the script) to avoid shell injection
+        run: |
+          set -f
+          args=(run)
+          if [ "$SHARD" = "routes" ]; then args+=(--routes $ROUTES); else args+=(--origins "$SHARD"); fi
+          if [ -n "$DATES" ]; then args+=(--dates $DATES); else args+=(--days $DAYS); fi
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          echo "python -m ingestion ${args[*]}"
+          python -m ingestion "${args[@]}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.shard }}
+          path: logs/
+          retention-days: 14
+          if-no-files-found: ignore
