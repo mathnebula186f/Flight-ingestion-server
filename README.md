@@ -346,12 +346,3 @@ Goal: given a route and departure date, draw the **expected price curve** from t
 - Evaluation: train on earlier departure dates, test on later ones; measure price error and
   "predicted cheapest day vs actual cheapest day".
 - Stage 1 route-level (Google history), stage 2 per-itinerary (after ~30+ days of our own data).
-
-### 3. Application server (later)
-
-FastAPI service reading Neon: routes, price history, predicted curve, cheapest day, airline comparison; optionally
-triggers manual ingestion through the GitHub API.
-
-### 4. Frontend (later)
-
-Next.js dashboard: route + date picker, price-history chart with forecast, cheapest-day view, airline comparison.
